@@ -103,10 +103,15 @@ export default function App() {
           },
         );
 
+        // Revoke old result URL if retrying
         setJobs((prev) =>
-          prev.map((j) =>
-            j.id === job.id ? { ...j, status: 'done', resultUrl } : j,
-          ),
+          prev.map((j) => {
+            if (j.id === job.id) {
+              if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+              return { ...j, status: 'done', resultUrl };
+            }
+            return j;
+          }),
         );
       } catch (err) {
         setJobs((prev) =>
@@ -162,10 +167,15 @@ export default function App() {
           },
         );
 
+        // Revoke old result URL if retrying
         setJobs((prev) =>
-          prev.map((j) =>
-            j.id === jobId ? { ...j, status: 'done', resultUrl } : j,
-          ),
+          prev.map((j) => {
+            if (j.id === jobId) {
+              if (j.resultUrl) URL.revokeObjectURL(j.resultUrl);
+              return { ...j, status: 'done', resultUrl };
+            }
+            return j;
+          }),
         );
       } catch (err) {
         setJobs((prev) =>

@@ -1,6 +1,6 @@
 /**
  * Web Worker for ONNX Runtime inference.
- * Runs off the main thread so the UI stays responsive.
+ * Processes tiles sequentially to avoid memory pressure from concurrent inference.
  */
 
 import * as ort from 'onnxruntime-web';
@@ -11,10 +11,19 @@ ort.env.wasm.wasmPaths =
 
 let session: ort.InferenceSession | null = null;
 
+// Sequential processing queue
+interface QueuedTask {
+  buffer: ArrayBuffer;
+  shape: number[];
+  resolve: (outputBuffer: ArrayBuffer) => void;
+  reject: (err: Error) => void;
+}
+const taskQueue: QueuedTask[] = [];
+let processing = false;
+
 export interface WorkerRequest {
   type: 'load' | 'run';
   modelUrl?: string;
-  /** Float32Array buffer (transferred) */
   tensor?: ArrayBuffer;
   shape?: number[];
 }
@@ -22,9 +31,7 @@ export interface WorkerRequest {
 export interface WorkerResponse {
   type: 'loaded' | 'result' | 'progress' | 'error';
   message?: string;
-  /** Model download progress (0-100) */
   progress?: number;
-  /** Float32Array buffer (transferred back) */
   outputBuffer?: ArrayBuffer;
   outputShape?: readonly number[];
 }
@@ -32,10 +39,9 @@ export interface WorkerResponse {
 /** Load the ONNX model with progress reporting */
 async function loadModel(modelUrl: string): Promise<void> {
   try {
-    // Fetch model with progress tracking
     const response = await fetch(modelUrl);
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      throw new Error(`HTTP ${response.status}`);
     }
 
     const contentLength = response.headers.get('content-length');
@@ -48,21 +54,16 @@ async function loadModel(modelUrl: string): Promise<void> {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       chunks.push(value);
       received += value.length;
-
       if (total > 0) {
-        const pct = Math.round((received / total) * 100);
         postMessage({
           type: 'progress',
-          progress: pct,
-          message: `正在下载模型... ${pct}%`,
+          progress: Math.round((received / total) * 100),
         } satisfies WorkerResponse);
       }
     }
 
-    // Combine chunks into a single ArrayBuffer
     const buffer = new Uint8Array(received);
     let pos = 0;
     for (const chunk of chunks) {
@@ -70,7 +71,6 @@ async function loadModel(modelUrl: string): Promise<void> {
       pos += chunk.length;
     }
 
-    // Create session from buffer (avoids second network request)
     session = await ort.InferenceSession.create(buffer.buffer, {
       executionProviders: ['webgpu', 'wasm'],
     });
@@ -84,45 +84,41 @@ async function loadModel(modelUrl: string): Promise<void> {
   }
 }
 
-/** Run inference on input tensor */
+/** Process the task queue sequentially */
+async function processQueue(): Promise<void> {
+  if (processing || taskQueue.length === 0) return;
+  processing = true;
+
+  while (taskQueue.length > 0) {
+    const task = taskQueue.shift()!;
+    try {
+      const outputBuffer = await runInference(task.buffer, task.shape);
+      task.resolve(outputBuffer);
+    } catch (err) {
+      task.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  processing = false;
+}
+
+/** Run inference on a single tile */
 async function runInference(
   buffer: ArrayBuffer,
   shape: number[],
-): Promise<void> {
+): Promise<ArrayBuffer> {
   if (!session) {
-    postMessage({
-      type: 'error',
-      message: 'Model not loaded. Call load first.',
-    } satisfies WorkerResponse);
-    return;
+    throw new Error('Model not loaded');
   }
 
-  try {
-    const tensor = new ort.Tensor('float32', new Float32Array(buffer), shape);
-    const feeds: Record<string, ort.Tensor> = {};
+  const tensor = new ort.Tensor('float32', new Float32Array(buffer), shape);
+  const feeds: Record<string, ort.Tensor> = {};
+  feeds[session.inputNames[0]] = tensor;
 
-    const inputName = session.inputNames[0];
-    feeds[inputName] = tensor;
+  const results = await session.run(feeds);
+  const output = results[session.outputNames[0]];
 
-    const results = await session.run(feeds);
-    const outputName = session.outputNames[0];
-    const output = results[outputName];
-
-    const outputBuffer = (output.data as Float32Array).buffer.slice(0) as ArrayBuffer;
-    postMessage(
-      {
-        type: 'result',
-        outputBuffer,
-        outputShape: output.dims,
-      } satisfies WorkerResponse,
-      { transfer: [outputBuffer] },
-    );
-  } catch (err) {
-    postMessage({
-      type: 'error',
-      message: `Inference failed: ${err instanceof Error ? err.message : String(err)}`,
-    } satisfies WorkerResponse);
-  }
+  return (output.data as Float32Array).buffer.slice(0) as ArrayBuffer;
 }
 
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
@@ -131,6 +127,25 @@ self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   if (type === 'load' && e.data.modelUrl) {
     loadModel(e.data.modelUrl);
   } else if (type === 'run' && e.data.tensor && e.data.shape) {
-    runInference(e.data.tensor, e.data.shape);
+    // Enqueue for sequential processing
+    new Promise<ArrayBuffer>((resolve, reject) => {
+      taskQueue.push({
+        buffer: e.data.tensor!,
+        shape: e.data.shape!,
+        resolve,
+        reject,
+      });
+      processQueue();
+    }).then((outputBuffer) => {
+      postMessage(
+        { type: 'result', outputBuffer } satisfies WorkerResponse,
+        { transfer: [outputBuffer] },
+      );
+    }).catch((err) => {
+      postMessage({
+        type: 'error',
+        message: err instanceof Error ? err.message : String(err),
+      } satisfies WorkerResponse);
+    });
   }
 };

@@ -160,16 +160,27 @@ export function useUpscaler() {
     [runTile],
   );
 
-  /** Convert canvas to Image for next pass */
+  /** Convert canvas to Image for next pass. Revokes intermediate blob URL. */
   const canvasToImage = useCallback(
     (canvas: HTMLCanvasElement): Promise<HTMLImageElement> => {
       return new Promise((resolve, reject) => {
         const img = new Image();
-        img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error('Failed to convert canvas to image'));
+        let blobUrl: string;
+        img.onload = () => {
+          URL.revokeObjectURL(blobUrl);
+          resolve(img);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(blobUrl);
+          reject(new Error('Failed to convert canvas to image'));
+        };
         canvas.toBlob((blob) => {
-          if (blob) img.src = URL.createObjectURL(blob);
-          else reject(new Error('Failed to create blob'));
+          if (blob) {
+            blobUrl = URL.createObjectURL(blob);
+            img.src = blobUrl;
+          } else {
+            reject(new Error('Failed to create blob'));
+          }
         }, 'image/png');
       });
     },
