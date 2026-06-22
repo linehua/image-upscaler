@@ -5,8 +5,11 @@
 
 import * as ort from 'onnxruntime-web';
 
+// Load WASM files from CDN (faster, offloads 27MB from origin)
+ort.env.wasm.wasmPaths =
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/';
+
 let session: ort.InferenceSession | null = null;
-let scaleFactor = 2; // default 2x
 
 export interface WorkerRequest {
   type: 'load' | 'run';
@@ -19,18 +22,59 @@ export interface WorkerRequest {
 export interface WorkerResponse {
   type: 'loaded' | 'result' | 'progress' | 'error';
   message?: string;
+  /** Model download progress (0-100) */
+  progress?: number;
   /** Float32Array buffer (transferred back) */
   outputBuffer?: ArrayBuffer;
   outputShape?: readonly number[];
 }
 
-/** Load the ONNX model */
+/** Load the ONNX model with progress reporting */
 async function loadModel(modelUrl: string): Promise<void> {
   try {
-    // Use fetch with progress tracking for large model files
-    session = await ort.InferenceSession.create(modelUrl, {
+    // Fetch model with progress tracking
+    const response = await fetch(modelUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const contentLength = response.headers.get('content-length');
+    const total = contentLength ? parseInt(contentLength, 10) : 0;
+
+    const reader = response.body!.getReader();
+    const chunks: Uint8Array[] = [];
+    let received = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      chunks.push(value);
+      received += value.length;
+
+      if (total > 0) {
+        const pct = Math.round((received / total) * 100);
+        postMessage({
+          type: 'progress',
+          progress: pct,
+          message: `正在下载模型... ${pct}%`,
+        } satisfies WorkerResponse);
+      }
+    }
+
+    // Combine chunks into a single ArrayBuffer
+    const buffer = new Uint8Array(received);
+    let pos = 0;
+    for (const chunk of chunks) {
+      buffer.set(chunk, pos);
+      pos += chunk.length;
+    }
+
+    // Create session from buffer (avoids second network request)
+    session = await ort.InferenceSession.create(buffer.buffer, {
       executionProviders: ['webgpu', 'wasm'],
     });
+
     postMessage({ type: 'loaded' } satisfies WorkerResponse);
   } catch (err) {
     postMessage({
@@ -57,7 +101,6 @@ async function runInference(
     const tensor = new ort.Tensor('float32', new Float32Array(buffer), shape);
     const feeds: Record<string, ort.Tensor> = {};
 
-    // Real-ESRGAN ONNX model: input name is typically "input" or first input name
     const inputName = session.inputNames[0];
     feeds[inputName] = tensor;
 
@@ -65,7 +108,6 @@ async function runInference(
     const outputName = session.outputNames[0];
     const output = results[outputName];
 
-    // Transfer the output buffer back to the main thread
     const outputBuffer = (output.data as Float32Array).buffer.slice(0) as ArrayBuffer;
     postMessage(
       {
@@ -83,7 +125,6 @@ async function runInference(
   }
 }
 
-// Message handler
 self.onmessage = (e: MessageEvent<WorkerRequest>) => {
   const { type } = e.data;
 

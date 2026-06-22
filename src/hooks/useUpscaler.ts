@@ -20,44 +20,57 @@ export function useUpscaler() {
   const pendingResolveRef = useRef<((buffer: ArrayBuffer) => void) | null>(null);
 
   /** Initialize the worker and load the model (once) */
-  const initWorker = useCallback((modelUrl: string): Promise<Worker> => {
-    return new Promise((resolve, reject) => {
-      if (workerRef.current) {
-        resolve(workerRef.current);
-        return;
-      }
+  const initWorker = useCallback(
+    (
+      modelUrl: string,
+      onProgress?: (p: UpscaleProgress) => void,
+    ): Promise<Worker> => {
+      return new Promise((resolve, reject) => {
+        if (workerRef.current) {
+          resolve(workerRef.current);
+          return;
+        }
 
-      const worker = new Worker(
-        new URL('../workers/inference.worker.ts', import.meta.url),
-        { type: 'module' },
-      );
+        const worker = new Worker(
+          new URL('../workers/inference.worker.ts', import.meta.url),
+          { type: 'module' },
+        );
 
-      worker.onmessage = (e) => {
-        const data = e.data as {
-          type: 'loaded' | 'result' | 'error';
-          outputBuffer?: ArrayBuffer;
-          outputShape?: number[];
-          message?: string;
+        worker.onmessage = (e) => {
+          const data = e.data as {
+            type: 'loaded' | 'result' | 'error' | 'progress';
+            outputBuffer?: ArrayBuffer;
+            outputShape?: number[];
+            message?: string;
+            progress?: number;
+          };
+
+          if (data.type === 'loaded') {
+            workerRef.current = worker;
+            resolve(worker);
+          } else if (data.type === 'result' && data.outputBuffer) {
+            pendingResolveRef.current?.(data.outputBuffer);
+            pendingResolveRef.current = null;
+          } else if (data.type === 'progress') {
+            onProgress?.({
+              phase: 'loading-model',
+              current: data.progress ?? 0,
+              total: 100,
+            });
+          } else if (data.type === 'error') {
+            reject(new Error(data.message));
+          }
         };
 
-        if (data.type === 'loaded') {
-          workerRef.current = worker;
-          resolve(worker);
-        } else if (data.type === 'result' && data.outputBuffer) {
-          pendingResolveRef.current?.(data.outputBuffer);
-          pendingResolveRef.current = null;
-        } else if (data.type === 'error') {
-          reject(new Error(data.message));
-        }
-      };
+        worker.onerror = (err) => {
+          reject(new Error(`Worker error: ${err.message}`));
+        };
 
-      worker.onerror = (err) => {
-        reject(new Error(`Worker error: ${err.message}`));
-      };
-
-      worker.postMessage({ type: 'load', modelUrl });
-    });
-  }, []);
+        worker.postMessage({ type: 'load', modelUrl });
+      });
+    },
+    [],
+  );
 
   /** Run a single tile through the model */
   const runTile = useCallback(
@@ -175,8 +188,8 @@ export function useUpscaler() {
       format: 'png' | 'jpeg' | 'webp',
       onProgress: (p: UpscaleProgress) => void,
     ): Promise<string> => {
-      onProgress({ phase: 'loading-model' });
-      await initWorker(modelUrl);
+      onProgress({ phase: 'loading-model', current: 0, total: 100 });
+      await initWorker(modelUrl, onProgress);
 
       const passes = scaleFactor === 4 ? 2 : 1;
 

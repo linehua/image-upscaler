@@ -111,7 +111,12 @@ export default function JobCard({ job, format, onRetry, onRemove }: JobCardProps
 function getStatusLabel(job: ImageJob): string {
   switch (job.status) {
     case 'pending': return '等待中';
-    case 'loading-model': return '加载模型';
+    case 'loading-model': {
+      if (job.current != null && job.total != null) {
+        return `下载模型 ${job.current}%`;
+      }
+      return '加载模型';
+    }
     case 'preprocessing': return '预处理';
     case 'inferring': {
       const pass = job.pass ? `第${job.pass}轮 ` : '';
